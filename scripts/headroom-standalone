@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Standalone Headroom compressor for shell pipelines.
+
+Requires the `headroom-ai` package importable by the interpreter that
+runs this script (e.g. invoke with the project venv's python, or
+install headroom-ai into the environment on PATH).
+
+Reads arbitrary text from stdin, runs it through Headroom's full
+compression pipeline (ContentRouter -> SmartCrusher / CodeCompressor /
+Kompress), and writes the compressed text to stdout. Stats go to stderr
+so the output stays pipeable.
+
+Usage:
+    cat file.js | headroom-standalone
+    kubectl logs pod | headroom-standalone --ratio 0.3
+    cat big.json | headroom-standalone --stats-only
+    cat src/app.py | headroom-standalone --name app.py
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+# Quiet known-benign noise: transformers warning that torch is absent (we
+# only use its tokenizer; Kompress runs on ONNX) and the HF Hub
+# unauthenticated-download hint (model is cached after first run).
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="headroom-standalone",
+        description="Compress piped text through Headroom's pipeline.",
+    )
+    parser.add_argument(
+        "--name",
+        default="piped-input",
+        help="Logical name for the input (helps content-type detection, e.g. app.py)",
+    )
+    parser.add_argument(
+        "--ratio",
+        type=float,
+        default=None,
+        help="Target compression ratio, 0..1 (fraction of content to keep)",
+    )
+    parser.add_argument(
+        "--model",
+        default="claude-sonnet-4-5-20250929",
+        help="Model used for token counting",
+    )
+    parser.add_argument(
+        "--stats-only",
+        action="store_true",
+        help="Print only the savings stats, not the compressed content",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a JSON object with content + stats instead of plain text",
+    )
+    args = parser.parse_args()
+
+    if sys.stdin.isatty():
+        parser.error("no input on stdin — pipe something in, e.g.: cat file.js | headroom-standalone")
+
+    text = sys.stdin.read()
+    if not text.strip():
+        return 0
+
+    from headroom import compress
+
+    # Frame the input as a generic tool output: that is the content class
+    # Headroom's router actually compresses. Deliberately NOT named Read/
+    # Grep/Bash etc. — those are in DEFAULT_EXCLUDE_TOOLS and would be
+    # protected as fresh agent reads.
+    messages = [
+        {"role": "user", "content": f"Inspect the output of {args.name}"},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "standalone",
+                    "name": "piped_output",
+                    "input": {"source": args.name},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "standalone", "content": text}
+            ],
+        },
+    ]
+
+    kwargs = {"protect_recent": 0}
+    if args.ratio is not None:
+        kwargs["target_ratio"] = args.ratio
+
+    result = compress(messages, model=args.model, **kwargs)
+
+    # Pull the (possibly compressed) tool_result text back out.
+    compressed_text = text
+    for message in result.messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                inner = block.get("content")
+                if isinstance(inner, str):
+                    compressed_text = inner
+                elif isinstance(inner, list):
+                    compressed_text = "".join(
+                        part.get("text", "")
+                        for part in inner
+                        if isinstance(part, dict) and part.get("type") == "text"
+                    )
+
+    pct = result.compression_ratio * 100
+    stats = (
+        f"[headroom] {result.tokens_before:,} -> {result.tokens_after:,} tokens "
+        f"(saved {result.tokens_saved:,}, {pct:.0f}%) "
+        f"transforms: {', '.join(result.transforms_applied) or 'none'}"
+    )
+
+    if args.json:
+        json.dump(
+            {
+                "content": compressed_text,
+                "tokens_before": result.tokens_before,
+                "tokens_after": result.tokens_after,
+                "tokens_saved": result.tokens_saved,
+                "compression_ratio": result.compression_ratio,
+                "transforms": result.transforms_applied,
+            },
+            sys.stdout,
+        )
+        sys.stdout.write("\n")
+    elif args.stats_only:
+        print(stats)
+    else:
+        sys.stdout.write(compressed_text)
+        if not compressed_text.endswith("\n"):
+            sys.stdout.write("\n")
+        print(stats, file=sys.stderr)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
